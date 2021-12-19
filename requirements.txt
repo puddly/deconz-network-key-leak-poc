@@ -1,0 +1,3 @@
+git+https://github.com/riverloopsec/killerbee.git@3.0.0-beta.2
+tqdm==4.62.3
+scapy==2.4.5

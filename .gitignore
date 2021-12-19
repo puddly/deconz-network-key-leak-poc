@@ -1,0 +1,5 @@
+.qmake*
+*.o
+utils/generate_network_key
+.DS_Store
+Makefile
