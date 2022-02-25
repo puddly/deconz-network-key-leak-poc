@@ -38,9 +38,9 @@ def format_key(key: bytes) -> str:
 
 
 class BaseLCG:
-    multiplier = None
-    increment = None
-    modulus = None
+    multiplier: int
+    increment: int
+    modulus: int
 
     def __init__(self, seed: int):
         self.state = seed & 0xFFFFFFFF
@@ -173,7 +173,7 @@ def validate_key(packet: scapy.layers.dot15d4.Dot15d4, key: bytes) -> bool:
 
 def extract_unique_deconz_packets(
     reader: scapy.all.PcapReader,
-) -> typing.Iterable[int, scapy.layers.dot15d4.Dot15d4]:
+) -> typing.Iterable[tuple[int, scapy.layers.dot15d4.Dot15d4]]:
     seen_networks = set()
 
     for packet in reader:
@@ -215,6 +215,8 @@ def find_deconz_network_key(packet: scapy.layers.dot15d4.Dot15d4) -> bytes | Non
     ):
         if validate_key(packet, key):
             return key
+    else:
+        return None
 
 
 if __name__ == "__main__":
