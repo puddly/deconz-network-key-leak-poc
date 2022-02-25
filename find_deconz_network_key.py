@@ -42,7 +42,7 @@ class BaseLCG:
 
     def __next__(self) -> int:
         self.state = (self.state * self.multiplier + self.increment) % self.modulus
-        return self.state
+        return self.transform(self.state)
 
     def __iter__(self):
         return self
