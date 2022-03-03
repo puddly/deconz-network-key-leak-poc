@@ -5,6 +5,8 @@ coordinator that has been reset from the Phoscon web interface.
 ⚠️ **Raspbee and Conbee devices used out-of-the-box (i.e. never reset) are unaffected
 because the factory-programmed network key is securely generated.** ⚠️
 
+✅ **Fixed in https://github.com/dresden-elektronik/deconz-rest-plugin/pull/5833** ✅
+
 ## Background
 The deCONZ REST plugin uses the [C `rand()` function](https://en.cppreference.com/w/c/numeric/random/rand) to generate both the Zigbee network PAN ID and the network key when an adapter is factory reset.  `rand()` is a simple [Linear congruential generator](https://en.wikipedia.org/wiki/Linear_congruential_generator) on every common platform, which is unsuitable for generating secret keys.
 
